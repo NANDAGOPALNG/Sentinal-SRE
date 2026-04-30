@@ -1,0 +1,8 @@
+version: "3.9"
+services:
+  sandbox:
+    build: ./app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/var/log/sentinal
