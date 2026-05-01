@@ -1,5 +1,9 @@
 # SentinalSRE
 
+<p align="center">
+<img width="3168" height="1344" alt="SentinalSRE_banner" src="https://github.com/user-attachments/assets/ff780466-ff55-4920-9baa-8cabcfa5dab5" />
+</p>
+
 **Autonomous Local-First SRE Engine — Zero Cloud, Zero Rate Limits, Zero Manual Triage**
 
 A production-grade, multi-agent DevOps orchestration system that detects incidents from live logs, performs Root Cause Analysis, self-corrects its own patches through a cyclic verification loop, and opens a GitHub Pull Request all running entirely on a local NVIDIA GPU via Ollama.
@@ -53,33 +57,12 @@ Latency_total = T_pipeline_end - T_pipeline_start
 
 SentinalSRE is built as a stateful, cyclic LangGraph `StateGraph`. All nodes share a single `SREState` TypedDict that flows through the entire pipeline.
 
-```
-START
-  |
-  v
-LOG_MONITOR  -->  ANALYST  -->  MANAGER  -->  ENGINEER
-                     ^                            |
-                     |                            v
-                     |                     SYNTAX_CHECKER
-                     |                       |         |
-                     |                     FAIL       PASS
-                     |                       |         |
-                     +<----------------------+      REVIEWER
-                     |                              |       |
-                     |                          REJECTED  APPROVED
-                     +<-----------------------------+         |
-                                                        [interrupt]
-                                                             |
-                                                          DEPLOY  <-- HITL breakpoint
-                                                             |
-                                               +-------------+-------------+
-                                            approved                   rejected
-                                               |                           |
-                                           OPEN_PR                        END
-                                           (GitHub MCP)
-                                               |
-                                              END
-```
+
+<p align="center">
+<img width="867" height="964" alt="SentinalSRE-workflow" src="https://github.com/user-attachments/assets/7beb5cf8-f70c-46da-b55a-e77705d538c2" />
+</p>
+
+
 
 ### Node Responsibilities
 
