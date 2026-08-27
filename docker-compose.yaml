@@ -1,8 +1,32 @@
 version: "3.9"
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentinal
+      POSTGRES_PASSWORD: sentinal
+      POSTGRES_DB: sentinal_orders
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinal -d sentinal_orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   sandbox:
     build: ./app
     ports:
       - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://sentinal:sentinal@postgres:5432/sentinal_orders
     volumes:
       - ./logs:/var/log/sentinal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

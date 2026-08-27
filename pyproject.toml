@@ -5,11 +5,18 @@ description = "Autonomous SRE Engine — Multi-Agent MTTR Reduction"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.136.0",
+    "fastapi==0.115.0",
+    "httpx==0.27.2",
     "langchain-ollama>=1.1.0",
     "langgraph>=1.1.9",
     "langsmith>=0.7.35",
     "mcp>=1.27.0",
+    "psycopg2-binary==2.9.10",
+    "pytest==8.3.3",
     "python-dotenv>=1.2.2",
-    "uvicorn>=0.45.0",
+    "sqlalchemy==2.0.36",
+    "uvicorn[standard]==0.32.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
