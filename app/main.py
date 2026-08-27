@@ -11,13 +11,14 @@ import logging
 import os
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
 
-from . import models  # noqa: F401 - registers Order with SQLAlchemy metadata
-from .database import Base, engine, get_db
-from .service import InvalidOrderError, OrderNotFoundError, OrderService
+import models  # noqa: F401 - registers Order with SQLAlchemy metadata
+from database import Base, engine, get_db
+from service import InvalidOrderError, OrderNotFoundError, OrderService
 
 
 LOG_FILE = "/var/log/sentinal/app.log"
@@ -38,7 +39,7 @@ app = FastAPI(title="SentinalSRE-Sandbox")
 
 
 # Demo app: create tables on startup instead of running migrations.
-#Base.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
 
 class OrderCreateRequest(BaseModel):
@@ -55,6 +56,21 @@ class OrderResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all for anything that isn't an intentional HTTPException.
+
+    Logs full context to /var/log/sentinal/app.log for triage and
+    returns a generic 500 to the client rather than leaking internals.
+    """
+    logger.error(
+        f"Unhandled exception on {request.method} {request.url.path}: "
+        f"{type(exc).__name__}: {exc}"
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 @app.get("/")

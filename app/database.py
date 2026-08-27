@@ -21,7 +21,12 @@ DATABASE_URL = os.getenv(
     "postgresql://sentinal:sentinal@postgres:5432/sentinal_orders",
 )
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=3,
+    max_overflow=2,
+    pool_timeout=5,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -29,7 +34,5 @@ Base = declarative_base()
 def get_db():
     """FastAPI dependency that yields a request-scoped DB session."""
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    yield db
+    db.close()
