@@ -199,6 +199,7 @@ def _hitl_prompt(state: dict, wall_elapsed: float, gpu_elapsed: float) -> bool:
     print(f"{C.RED}{C.BOLD}  HUMAN-IN-THE-LOOP  -  OPERATOR APPROVAL REQUIRED{C.RESET}")
     print("=" * 66)
     print(f"\n  Incident    : {state.get('incident_id', 'N/A')}")
+    print(f"  Target File : {state.get('target_file', 'N/A')}")
     print(f"  Iterations  : {state.get('iteration_count', 0)}")
     print(f"  Verified    : {state.get('is_verified', False)}")
 
@@ -247,6 +248,7 @@ def _render_node_output(node: str, output: dict):
 
     elif node == "analyst":
         _print_field("RCA Hypothesis",    output.get("rca_hypothesis", ""),    colour, 400)
+        print(f"  {colour}  Target File : {output.get('target_file', '?')}{C.RESET}")
         print(f"  {colour}  Iteration : #{output.get('iteration_count', '?')}{C.RESET}")
 
     elif node == "manager":
@@ -254,6 +256,7 @@ def _render_node_output(node: str, output: dict):
 
     elif node == "engineer":
         _print_field("Proposed Patch",    output.get("proposed_patch", ""),    colour, 400)
+        print(f"  {colour}  Target File : {output.get('target_file', '?')}{C.RESET}")
 
     elif node == "syntax_checker":
         verdict = "PASS" if output.get("is_verified") else "FAIL"
@@ -300,8 +303,11 @@ async def run_sentinal():
         "log_data":          "",
         "sanitized_summary": "",
         "rca_hypothesis":    "",
+        "target_file":       "",
+        "original_source":   "",
         "manager_directive": "",
         "proposed_patch":    "",
+        "patched_source":    "",
         "pr_result":         "",
         "iteration_count":   0,
         "is_verified":       False,

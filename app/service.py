@@ -11,7 +11,7 @@ so main.py can translate them into the appropriate HTTP responses.
 
 from sqlalchemy.orm import Session
 
-from repository import OrderRepository
+from .repository import OrderRepository
 
 
 class OrderNotFoundError(Exception):

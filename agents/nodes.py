@@ -56,6 +56,7 @@ All nodes are async (async def).
 
 import os
 import re
+import ast
 import sys
 import json
 import time
@@ -86,10 +87,16 @@ llm = ChatOllama(
 # =============================================================================
 # PATH CONSTANTS
 # =============================================================================
-_BASE         = os.path.dirname(__file__)
-LOG_PATH      = os.path.abspath(os.path.join(_BASE, "..", "logs", "app.log"))
-APP_CODE_PATH = os.path.abspath(os.path.join(_BASE, "..", "app", "main.py"))
-MCP_LOG_PATH  = os.path.abspath(os.path.join(_BASE, "..", "mcp_server", "server.py"))
+_BASE          = os.path.dirname(__file__)
+LOG_PATH       = os.path.abspath(os.path.join(_BASE, "..", "logs", "app.log"))
+APP_SOURCE_DIR = os.path.abspath(os.path.join(_BASE, "..", "app"))
+MCP_LOG_PATH   = os.path.abspath(os.path.join(_BASE, "..", "mcp_server", "server.py"))
+
+# Explicit allow-list of application source files the agents may read or
+# patch. Deliberately not a blind directory dump: this keeps prompts
+# bounded and gives the target-file parser something concrete to
+# validate LLM output against.
+APP_SOURCE_FILES = ["main.py", "database.py", "models.py", "repository.py", "service.py"]
 
 GPU_BADGE = "\033[92m[LOCAL PROCESSING -- NVIDIA GPU ACTIVE]\033[0m"
 
@@ -155,12 +162,63 @@ def _read_logs_direct(lines: int = 80) -> str:
         return "".join(f.readlines()[-lines:])
 
 
-def _read_app_source() -> str:
-    """Read ./app/main.py for source-code correlation in RCA and patch generation."""
-    if not os.path.exists(APP_CODE_PATH):
-        return f"[ERROR] Source file not found: {APP_CODE_PATH}"
-    with open(APP_CODE_PATH, "r", encoding="utf-8") as f:
+def _read_app_sources() -> dict:
+    """
+    Read every known application source file.
+
+    Returns {"app/main.py": "<source>", "app/database.py": "<source>", ...}.
+    A missing file gets an [ERROR] placeholder instead of raising, so one
+    missing file doesn't take down the whole pipeline.
+    """
+    sources = {}
+    for filename in APP_SOURCE_FILES:
+        rel_path = f"app/{filename}"
+        abs_path = os.path.join(APP_SOURCE_DIR, filename)
+        if os.path.exists(abs_path):
+            with open(abs_path, "r", encoding="utf-8") as f:
+                sources[rel_path] = f.read()
+        else:
+            sources[rel_path] = f"[ERROR] Source file not found: {abs_path}"
+    return sources
+
+
+def _format_app_sources(sources: dict) -> str:
+    """Render {path: source} as '=== path ===' blocks for LLM prompts."""
+    return "\n\n".join(f"=== {path} ===\n{source}" for path, source in sources.items())
+
+
+def _read_target_file(target_file: str) -> str:
+    """Read a single app source file addressed as 'app/<name>.py'."""
+    filename = os.path.basename(target_file)
+    abs_path = os.path.join(APP_SOURCE_DIR, filename)
+    if not os.path.exists(abs_path):
+        return f"[ERROR] Source file not found: {abs_path}"
+    with open(abs_path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def _normalize_target_file(raw: str) -> str:
+    """
+    Normalize an LLM-produced file reference (e.g. './app/database.py',
+    'app/database.py', 'database.py') to a canonical 'app/<name>.py',
+    validated against APP_SOURCE_FILES.
+
+    Falls back to 'app/main.py' -- with a printed warning -- if the value
+    can't be matched, so the pipeline keeps moving with a safe,
+    inspectable default rather than an arbitrary/unknown path.
+    """
+    candidate = (raw or "").strip().strip("`").replace("\\", "/")
+    filename = os.path.basename(candidate)
+    if filename in APP_SOURCE_FILES:
+        return f"app/{filename}"
+    print(f"  [TargetFile] Could not resolve '{raw}' to a known source file; defaulting to app/main.py")
+    return "app/main.py"
+
+
+def _parse_affected_file(rca: str) -> str:
+    """Extract the AFFECTED_FILE: value the analyst produced."""
+    m = re.search(r"AFFECTED_FILE:\s*(\S+)", rca)
+    return _normalize_target_file(m.group(1) if m else "")
 
 
 # =============================================================================
@@ -214,7 +272,8 @@ async def _github_mcp_open_pr(
     pr_title: str,
     pr_branch: str,
     pr_body: str,
-    patch_content: str,
+    target_file: str,
+    patched_source: str,
 ) -> str:
     """
     Execute the full GitHub PR creation flow via the official MCP server.
@@ -222,8 +281,12 @@ async def _github_mcp_open_pr(
     Steps (all within a single MCP ClientSession):
       1. get_file_contents  -> verify repo is accessible
       2. create_branch      -> create head branch from main's SHA
-      3. create_or_update_file -> commit the patched app/main.py to head branch
+      3. create_or_update_file -> commit the patched target_file to head branch
       4. create_pull_request   -> open the PR
+
+    target_file/patched_source are resolved once by engineer_node and
+    threaded through state, so this function commits exactly the file the
+    analyst/engineer identified -- never a hardcoded path.
 
     Returns the PR URL on success, or a detailed error string on failure.
     """
@@ -256,7 +319,7 @@ async def _github_mcp_open_pr(
                         arguments={
                             "owner": owner,
                             "repo":  repo,
-                            "path":  "app/main.py",
+                            "path":  target_file,
                         },
                     )
                     ref_text = "\n".join(
@@ -264,7 +327,7 @@ async def _github_mcp_open_pr(
                     )
                     print(f"  [GitHub MCP] Repo accessible. File found.")
                 except Exception as e:
-                    return f"[GitHub MCP ERROR] Cannot access {owner}/{repo}/app/main.py: {e}"
+                    return f"[GitHub MCP ERROR] Cannot access {owner}/{repo}/{target_file}: {e}"
 
                 # ── Step 2: Create the head branch ────────────────────────────
                 print(f"  [GitHub MCP] Step 2/4 -- creating branch '{pr_branch}' ...")
@@ -289,18 +352,17 @@ async def _github_mcp_open_pr(
                 # We detect code blocks in the engineer's output.
                 import base64
 
-                patched_source = _extract_patched_source(patch_content, _read_app_source())
                 encoded_content = base64.b64encode(patched_source.encode("utf-8")).decode("utf-8")
 
-                print(f"  [GitHub MCP] Step 3/4 -- committing fix to branch ...")
+                print(f"  [GitHub MCP] Step 3/4 -- committing fix to {target_file} ...")
                 try:
                     # Get current file SHA for the update API
                     sha = _extract_sha_from_file_result(ref_text)
                     commit_args = {
                         "owner":   owner,
                         "repo":    repo,
-                        "path":    "app/main.py",
-                        "message": f"fix({incident_id}): automated SRE remediation",
+                        "path":    target_file,
+                        "message": f"fix({incident_id}): automated SRE remediation for {target_file}",
                         "content": encoded_content,
                         "branch":  pr_branch,
                     }
@@ -311,9 +373,9 @@ async def _github_mcp_open_pr(
                         "create_or_update_file",
                         arguments=commit_args,
                     )
-                    print(f"  [GitHub MCP] File committed.")
+                    print(f"  [GitHub MCP] {target_file} committed.")
                 except Exception as e:
-                    return f"[GitHub MCP ERROR] Failed to commit file: {e}"
+                    return f"[GitHub MCP ERROR] Failed to commit {target_file}: {e}"
 
                 # ── Step 4: Open the Pull Request ─────────────────────────────
                 print(f"  [GitHub MCP] Step 4/4 -- opening pull request ...")
@@ -362,36 +424,40 @@ def _extract_sha_from_file_result(result_text: str) -> str:
         return match.group(1) if match else ""
 
 
-def _extract_patched_source(patch_content: str, original_source: str) -> str:
+def _extract_target_file_and_patch(patch_content: str, fallback_target_file: str) -> tuple[str, str]:
     """
-    Extract the final Python source to commit from the engineer's patch output.
+    Determine which file the engineer patched and extract its new content.
 
-    Strategy (in order of preference):
-      1. Look for a ```python ... ``` block containing a full module (has 'from fastapi').
-      2. Apply the unified diff in CODE_DIFF to the original source.
-      3. Fall back to the original source unchanged (safe -- PR still opens,
-         reviewer will catch that the fix wasn't applied).
+    target_file precedence:
+      1. TARGET_FILE: field in the engineer's own output.
+      2. fallback_target_file (the analyst's AFFECTED_FILE, passed in by the caller).
+      3. 'app/main.py' as an inspectable last resort (via _normalize_target_file).
 
-    This is necessary because Llama3 sometimes outputs full files, sometimes
-    proper unified diffs, and sometimes a mix. We handle all cases.
+    New-source precedence:
+      1. A ```python fenced code block (the format the prompt explicitly asks for).
+      2. A unified diff under CODE_DIFF, applied to the resolved file's original content.
+      3. The original file content, unchanged (safe fallback -- PR still opens;
+         reviewer/syntax-checker should catch that nothing effectively changed).
+
+    This replaces the old main.py-only _extract_patched_source now that the
+    engineer can target any file in APP_SOURCE_FILES.
     """
-    # Strategy 1: full Python file in a code block
+    target_match = re.search(r"TARGET_FILE:\s*(\S+)", patch_content)
+    target_file = _normalize_target_file(target_match.group(1) if target_match else fallback_target_file)
+    original_source = _read_target_file(target_file)
+
     python_blocks = re.findall(r"```python\n(.*?)```", patch_content, re.DOTALL)
-    for block in python_blocks:
-        if "from fastapi" in block or "FastAPI" in block:
-            return block.strip()
+    if python_blocks:
+        return target_file, python_blocks[0].strip()
 
-    # Strategy 2: apply unified diff
     diff_match = re.search(r"CODE_DIFF:\s*```diff\n(.*?)```", patch_content, re.DOTALL)
     if diff_match:
-        diff_text = diff_match.group(1).strip()
-        applied = _apply_unified_diff(original_source, diff_text)
+        applied = _apply_unified_diff(original_source, diff_match.group(1).strip())
         if applied and applied != original_source:
-            return applied
+            return target_file, applied
 
-    # Strategy 3: safe fallback -- return original so PR at least opens
-    print("  [PatchExtractor] Could not extract clean patch; committing original source.")
-    return original_source
+    print(f"  [PatchExtractor] Could not extract a clean patch for {target_file}; keeping original source.")
+    return target_file, original_source
 
 
 def _apply_unified_diff(source: str, diff: str) -> str:
@@ -557,8 +623,9 @@ async def analyst_node(state: dict) -> dict:
     )
     t0 = time.time()
 
-    summary  = state.get("sanitized_summary", "No log summary available.")
-    src_code = _read_app_source()
+    summary     = state.get("sanitized_summary", "No log summary available.")
+    src_sources = _read_app_sources()
+    src_bundle  = _format_app_sources(src_sources)
 
     retry_context = ""
     if iteration > 1:
@@ -572,28 +639,36 @@ async def analyst_node(state: dict) -> dict:
     response = await llm.ainvoke([
         SystemMessage(content=(
             "You are a senior SRE analyst. Correlate the incident summary with "
-            "the source code to identify the exact root cause.\n"
+            "the multi-file application source below to identify the exact root "
+            "cause and WHICH FILE actually contains the defect. The bug may not "
+            "be in main.py -- it can be in any of the provided files.\n"
             "Output ONLY this exact structure -- no extra text, no markdown headers:\n\n"
             "ROOT_CAUSE: <one sentence -- what failed and why>\n"
-            "AFFECTED_FILE: <file path>\n"
+            "AFFECTED_FILE: <the single file path, e.g. app/database.py>\n"
             "AFFECTED_LINE: <line number or range>\n"
             "EXPLANATION: <2-3 sentences of technical detail>\n"
             "FIX_STRATEGY: <1-2 sentences -- what the engineer should change>\n"
         )),
         HumanMessage(content=(
             f"Incident Summary:\n{summary}\n\n"
-            f"Source file -- ./app/main.py:\n{src_code}"
+            f"Application source files:\n{src_bundle}"
             f"{retry_context}"
         )),
     ])
 
     rca = response.content.strip()
+    target_file = _parse_affected_file(rca)
+    original_source = _read_target_file(target_file)
+
     _field("RCA Hypothesis", rca)
+    _field("Target File (analyst)", target_file, 200)
     print(f"\n  Node DT = {time.time() - t0:.2f} s")
 
     return {
         "messages":        [response],
         "rca_hypothesis":  rca,
+        "target_file":     target_file,
+        "original_source": original_source,
         "iteration_count": iteration,
     }
 
@@ -693,21 +768,26 @@ async def engineer_node(state: dict) -> dict:
     _node_header("  ENGINEER", "Generating code remediation patch ...")
     t0 = time.time()
 
-    rca       = state.get("rca_hypothesis",    "No RCA.")
-    directive = state.get("manager_directive", "No directive.")
-    summary   = state.get("sanitized_summary", "")
-    incident  = state.get("incident_id",       "INC-UNKNOWN")
-    src_code  = _read_app_source()
+    rca             = state.get("rca_hypothesis",    "No RCA.")
+    directive       = state.get("manager_directive", "No directive.")
+    summary         = state.get("sanitized_summary", "")
+    incident        = state.get("incident_id",       "INC-UNKNOWN")
+    analyst_target  = state.get("target_file", "") or "app/main.py"
+    src_bundle      = _format_app_sources(_read_app_sources())
 
     # Extract just the branch-friendly incident slug
     incident_slug = incident.lower().replace("_", "-")
 
     response = await llm.ainvoke([
         SystemMessage(content=(
-            "You are the SRE Engineer. Generate a production-safe code fix.\n\n"
+            "You are the SRE Engineer. Generate a production-safe code fix for "
+            "EXACTLY ONE file in this multi-file application -- the one that "
+            f"actually contains the defect (the analyst's best guess is {analyst_target}, "
+            "but confirm it yourself against the source).\n\n"
             "You MUST output ALL of the following fields in EXACTLY this format:\n\n"
             f"PR_TITLE: fix({incident}): <short description of the fix>\n"
             f"PR_BRANCH: fix/{incident_slug}-patch\n"
+            "TARGET_FILE: <the single file path you are patching, e.g. app/database.py>\n"
             "PR_DESCRIPTION:\n"
             "## Overview\n"
             "<one paragraph describing the incident and fix>\n\n"
@@ -717,7 +797,7 @@ async def engineer_node(state: dict) -> dict:
             "<bullet list of what changed>\n\n"
             "CODE_DIFF:\n"
             "```python\n"
-            "<the COMPLETE, FINAL version of ./app/main.py with the fix applied>\n"
+            "<the COMPLETE, FINAL version of TARGET_FILE with the fix applied>\n"
             "```\n\n"
             "TESTS_ADDED:\n"
             "- <test description 1>\n"
@@ -728,28 +808,36 @@ async def engineer_node(state: dict) -> dict:
             "STRICT RULES:\n"
             "- PR_BRANCH must be exactly: "
             f"fix/{incident_slug}-patch\n"
-            "- CODE_DIFF must contain the FULL file content, not just the changed lines.\n"
+            "- The ```python block must contain the FULL content of TARGET_FILE only,"
+            " not any other file, and not just the changed lines.\n"
             "- Do NOT use a unified diff format. Output the complete file.\n"
             "- The file must be valid Python that runs without errors.\n"
             "- Make the SMALLEST change that fixes the root cause.\n"
-            "- Do NOT remove unrelated endpoints or imports.\n"
+            "- Do NOT remove unrelated functions, classes, or imports from that file.\n"
         )),
         HumanMessage(content=(
             f"Incident: {incident}\n"
             f"Summary: {summary}\n\n"
             f"Root Cause Analysis:\n{rca}\n\n"
             f"Manager Directive:\n{directive}\n\n"
-            f"Current source -- ./app/main.py:\n{src_code}"
+            f"Application source files:\n{src_bundle}"
         )),
     ])
 
     patch = response.content.strip()
+    target_file, patched_source = _extract_target_file_and_patch(patch, analyst_target)
+    original_source = _read_target_file(target_file)
+
     _field("Proposed Patch", patch)
+    _field("Target File (engineer)", target_file, 200)
     print(f"\n  Node DT = {time.time() - t0:.2f} s")
 
     return {
-        "messages":       [response],
-        "proposed_patch": patch,
+        "messages":        [response],
+        "proposed_patch":  patch,
+        "target_file":     target_file,
+        "original_source": original_source,
+        "patched_source":  patched_source,
     }
 
 
@@ -772,11 +860,16 @@ async def syntax_checker_node(state: dict) -> dict:
     _node_header("  SYNTAX CHECKER", "Pre-validating patch structure ...")
     t0 = time.time()
 
-    patch   = state.get("proposed_patch", "")
-    src     = _read_app_source()
-    summary = state.get("sanitized_summary", "")
+    patch          = state.get("proposed_patch", "")
+    target_file    = state.get("target_file", "app/main.py")
+    patched_source = state.get("patched_source", "")
+    original_source = state.get("original_source", "")
+    summary        = state.get("sanitized_summary", "")
 
-    # Pass 1 -- hard-fail regex patterns
+    print(f"  -> Target file : {target_file}")
+
+    # Pass 1 -- hard-fail regex patterns, checked against both the raw LLM
+    # output and the actual extracted file content that would be committed.
     HARD_FAIL = [
         (r"raise\s+ConnectionTimeout\b",  "patch re-raises ConnectionTimeout"),
         (r"raise\s+DatabaseError\b",      "patch re-raises DatabaseError"),
@@ -784,37 +877,50 @@ async def syntax_checker_node(state: dict) -> dict:
         (r"def\s+trigger_crash.*?pass",   "patch blanks trigger_crash with pass only"),
     ]
     for pattern, reason in HARD_FAIL:
-        if re.search(pattern, patch, re.IGNORECASE | re.DOTALL):
+        if any(re.search(pattern, text, re.IGNORECASE | re.DOTALL) for text in (patch, patched_source)):
             print(f"  -> HARD FAIL -- {reason}")
             return {
-                "messages":    [AIMessage(content=f"[SyntaxChecker] Hard fail: {reason}")],
+                "messages":    [AIMessage(content=f"[SyntaxChecker] {target_file}: hard fail -- {reason}")],
                 "is_verified": False,
             }
 
-    # Pass 2 -- LLM structural review
+    # Pass 2 -- deterministic AST validation (no LLM; free and instant).
+    try:
+        ast.parse(patched_source, filename=target_file)
+    except SyntaxError as e:
+        reason = f"SyntaxError in {target_file}: {e.msg} (line {e.lineno})"
+        print(f"  -> AST FAIL -- {reason}")
+        return {
+            "messages":    [AIMessage(content=f"[SyntaxChecker] {target_file}: FAIL -- {reason}")],
+            "is_verified": False,
+        }
+    print(f"  -> AST parse OK for {target_file}")
+
+    # Pass 3 -- LLM structural review (file-agnostic, no longer assumes main.py)
     response = await llm.ainvoke([
         SystemMessage(content=(
-            "You are a Python syntax checker. Review the proposed patch.\n"
-            "Check ONLY these three things:\n"
-            "  1. Does the code block contain syntactically valid Python?\n"
-            "  2. Does it import only modules already present in the original source?\n"
-            "  3. Does it include the FastAPI app definition (not just a diff)?\n\n"
+            f"You are a Python syntax checker reviewing a proposed replacement for {target_file}.\n"
+            "Check ONLY these things:\n"
+            "  1. Is it a complete, self-consistent module (not a partial snippet)?\n"
+            "  2. Does it import only modules already present in the original file?\n"
+            "  3. Does it preserve the file's unrelated existing functions/classes?\n\n"
             "Respond with EXACTLY one line -- nothing else:\n"
-            "PASS: <one-sentence reason>\n"
+            f"PASS: <one-sentence reason>\n"
             "or\n"
-            "FAIL: <one-sentence reason>"
+            f"FAIL: <one-sentence reason>"
         )),
         HumanMessage(content=(
             f"Bug context: {summary[:200]}\n\n"
-            f"Original source:\n{src}\n\n"
-            f"Proposed patch:\n{patch[:2000]}"
+            f"Target file: {target_file}\n\n"
+            f"Original content:\n{original_source}\n\n"
+            f"Proposed new content:\n{patched_source[:2000]}"
         )),
     ])
 
     verdict_text = response.content.strip()
     passed = verdict_text.upper().startswith("PASS")
 
-    print(f"  -> Verdict : {'PASS' if passed else 'FAIL'}")
+    print(f"  -> Verdict : {'PASS' if passed else 'FAIL'}  (target: {target_file})")
     print(f"  -> Reason  : {verdict_text[:120]}")
     print(f"\n  Node DT = {time.time() - t0:.2f} s")
 
@@ -844,25 +950,39 @@ async def reviewer_node(state: dict) -> dict:
         print("  -> Skipped -- syntax check already set is_verified=False.")
         return {}
 
-    patch     = state.get("proposed_patch", "")
-    rca       = state.get("rca_hypothesis", "")
-    directive = state.get("manager_directive", "")
-    iteration = state.get("iteration_count", 1)
+    summary         = state.get("sanitized_summary", "")
+    patch           = state.get("proposed_patch", "")
+    rca             = state.get("rca_hypothesis", "")
+    directive       = state.get("manager_directive", "")
+    target_file     = state.get("target_file", "app/main.py")
+    original_source = state.get("original_source", "")
+    patched_source  = state.get("patched_source", "")
+    iteration       = state.get("iteration_count", 1)
+
+    print(f"  -> Target file : {target_file}")
 
     response = await llm.ainvoke([
         SystemMessage(content=(
             "You are the principal SRE reviewer. Evaluate the patch against:\n"
-            "  1. CORRECTNESS  -- Does it directly fix the stated root cause?\n"
+            "  1. CORRECTNESS  -- Does it directly fix the root cause described in the "
+            "incident evidence and RCA, IN THE FILE where that root cause actually lives?\n"
             "  2. SAFETY       -- No new exceptions, no data loss risk?\n"
-            "  3. COHERENCE    -- Is the code consistent with the RCA?\n"
-            "  4. COMPLETENESS -- Does it contain a full, runnable Python file?\n\n"
+            "  3. COHERENCE    -- Is the code consistent with the RCA and manager directive?\n"
+            "  4. COMPLETENESS -- Is the target file a full, runnable Python module?\n\n"
+            "Reject if the patch targets the wrong file, or if comparing the original vs "
+            "proposed content of the target file shows the actual defect was not addressed.\n"
+            "Reason from the evidence provided -- do not assume any particular file is "
+            "correct or incorrect a priori.\n\n"
             "Output ONLY valid JSON -- no markdown, no extra text:\n"
             '{"verdict": "APPROVED" | "REJECTED", "reason": "<one sentence>"}'
         )),
         HumanMessage(content=(
+            f"Incident evidence (sanitized log summary):\n{summary}\n\n"
+            f"Analyst RCA:\n{rca}\n\n"
             f"Manager Directive:\n{directive}\n\n"
-            f"Root Cause Analysis:\n{rca}\n\n"
-            f"Proposed Patch:\n{patch[:2500]}\n\n"
+            f"Target file: {target_file}\n\n"
+            f"Original content of {target_file}:\n{original_source}\n\n"
+            f"Proposed new content of {target_file}:\n{patched_source[:2500]}\n\n"
             f"Iteration #{iteration} -- be strict on repeated failures."
         )),
     ])
@@ -960,8 +1080,10 @@ async def open_pr_node(state: dict) -> dict:
     print("  |-- Inference : GitHub MCP (no LLM)")
     print(f"{'=' * 64}")
 
-    incident  = state.get("incident_id",    "INC-UNKNOWN")
-    patch     = state.get("proposed_patch", "")
+    incident       = state.get("incident_id",    "INC-UNKNOWN")
+    patch          = state.get("proposed_patch", "")
+    target_file    = state.get("target_file", "app/main.py")
+    patched_source = state.get("patched_source", "")
     token     = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
     owner     = os.getenv("GITHUB_OWNER",  "").strip()
     repo      = os.getenv("GITHUB_REPO",   "").strip()
@@ -987,6 +1109,7 @@ async def open_pr_node(state: dict) -> dict:
 
     print(f"  PR Title  : {pr_title}")
     print(f"  PR Branch : {pr_branch}")
+    print(f"  Target    : {target_file}")
     print(f"  Owner/Repo: {owner or '[NOT SET]'}/{repo or '[NOT SET]'}")
 
     # Pre-flight checks
@@ -1017,7 +1140,8 @@ async def open_pr_node(state: dict) -> dict:
         pr_title=pr_title,
         pr_branch=pr_branch,
         pr_body=pr_description,
-        patch_content=patch,
+        target_file=target_file,
+        patched_source=patched_source,
     )
 
     if "ERROR" in result:

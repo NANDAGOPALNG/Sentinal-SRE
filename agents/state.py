@@ -10,8 +10,11 @@ Pipeline flow tracked by this state:
   raw_logs          -> ingested by log_monitor via FastMCP stdio tool
   sanitized_summary -> PII-redacted summary (local LLM, <=200 tokens)
   rca_hypothesis    -> structured RCA from analyst (local LLM)
+  target_file       -> "app/<name>.py" the analyst/engineer identified as defective
+  original_source   -> current on-disk content of target_file
   manager_directive -> severity classification + fix strategy (local LLM)
   proposed_patch    -> full PR-formatted code fix + unified diff (local LLM)
+  patched_source    -> extracted full replacement content for target_file
   is_verified       -> True when reviewer approves patch (local LLM)
   user_approval     -> True after human operator confirms via HITL terminal
   pr_result         -> URL or result string returned by GitHub MCP open_pr_node
@@ -81,8 +84,11 @@ class SREState(TypedDict):
 
     # Agent outputs
     rca_hypothesis: str
+    target_file: str
+    original_source: str
     manager_directive: str
     proposed_patch: str
+    patched_source: str
 
     # GitHub action output
     pr_result: str

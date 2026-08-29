@@ -16,9 +16,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
 
-import models  # noqa: F401 - registers Order with SQLAlchemy metadata
-from database import Base, engine, get_db
-from service import InvalidOrderError, OrderNotFoundError, OrderService
+from . import models  # noqa: F401 - registers Order with SQLAlchemy metadata
+from .database import Base, engine, get_db
+from .service import InvalidOrderError, OrderNotFoundError, OrderService
 
 
 LOG_FILE = "/var/log/sentinal/app.log"
