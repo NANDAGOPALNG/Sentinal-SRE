@@ -1,16 +1,3 @@
-"""
-app/database.py
-================
-Database engine and session configuration.
-
-Responsibility: own the SQLAlchemy engine, session factory, declarative
-Base, and the `get_db` FastAPI dependency. No business logic and no
-HTTP concerns live here.
-
-Connection info comes from the DATABASE_URL environment variable so
-credentials are never hardcoded in source.
-"""
-
 import os
 
 from sqlalchemy import create_engine
@@ -23,9 +10,9 @@ DATABASE_URL = os.getenv(
 
 engine = create_engine(
     DATABASE_URL,
-    pool_size=3,
-    max_overflow=2,
-    pool_timeout=5,
+    pool_size=5,  # Adjusted from 3 to 5
+    max_overflow=10,  # Adjusted from 2 to 10
+    pool_timeout=30,  # Added a connection timeout setting
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
