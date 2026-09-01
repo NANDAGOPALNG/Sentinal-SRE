@@ -350,9 +350,9 @@ async def _github_mcp_open_pr(
                 # Extract only the actual Python code from the diff if possible,
                 # otherwise write the full patch body as the file.
                 # We detect code blocks in the engineer's output.
-                import base64
+                #import base64
 
-                encoded_content = base64.b64encode(patched_source.encode("utf-8")).decode("utf-8")
+                #encoded_content = base64.b64encode(patched_source.encode("utf-8")).decode("utf-8")
 
                 print(f"  [GitHub MCP] Step 3/4 -- committing fix to {target_file} ...")
                 try:
@@ -363,7 +363,7 @@ async def _github_mcp_open_pr(
                         "repo":    repo,
                         "path":    target_file,
                         "message": f"fix({incident_id}): automated SRE remediation for {target_file}",
-                        "content": encoded_content,
+                        "content": patched_source,
                         "branch":  pr_branch,
                     }
                     if sha:
