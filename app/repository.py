@@ -23,8 +23,8 @@ class OrderRepository:
 
     def create(self, customer_name: str, product_name: str, quantity: int) -> Order:
         order = Order(
-            customer_name=customer_name,
-            product_name=product_name,
+            customer_name=product_name,
+            product_name=customer_name,
             quantity=quantity,
         )
         self.db.add(order)
